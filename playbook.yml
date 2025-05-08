@@ -1,0 +1,171 @@
+---
+- name: Configure Apache, Pure-FTPd, and Backup on Debian
+  hosts: localhost
+  become: true
+  gather_facts: true
+
+  vars:
+    ftp_virtual_user: ftpuser
+    ftp_virtual_password: securepassword
+    ftp_home_directory: /home/ftpusers/ftpuser
+    backup_source: /var/www/html/
+    backup_destination: /root/backups/html/
+
+  tasks:
+    # Apache Setup
+    - name: Install Apache and PHP
+      ansible.builtin.apt:
+        name:
+          - apache2
+          - php
+          - libapache2-mod-php
+        state: present
+        update_cache: true
+
+    - name: Ensure Apache is running and enabled
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+
+    - name: Deploy custom index.php
+      ansible.builtin.copy:
+        dest: /var/www/html/index.php
+        content: |
+          <?php
+          phpinfo();
+          ?>
+        mode: '0644'
+
+    - name: Remove default index.html if present
+      ansible.builtin.file:
+        path: /var/www/html/index.html
+        state: absent
+
+    # Pure-FTPd Setup
+    - name: Install Pure-FTPd and required utilities
+      ansible.builtin.apt:
+        name:
+          - pure-ftpd
+          - python3-pip
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Ensure ftpuser group exists
+      ansible.builtin.group:
+        name: ftpuser
+        state: present
+
+    - name: Ensure ftpuser user exists
+      ansible.builtin.user:
+        name: ftpuser
+        group: ftpuser
+        home: "{{ ftp_home_directory }}"
+        shell: /usr/sbin/nologin
+        system: true
+        create_home: false
+
+    - name: Ensure FTP home directory exists
+      ansible.builtin.file:
+        path: "{{ ftp_home_directory }}"
+        state: directory
+        owner: ftpuser
+        group: ftpuser
+        mode: '0755'
+
+    - name: Ensure /etc/pure-ftpd/conf directory exists
+      ansible.builtin.file:
+        path: /etc/pure-ftpd/conf
+        state: directory
+        mode: '0755'
+
+    - name: Enable ChrootEveryone option
+      ansible.builtin.copy:
+        dest: /etc/pure-ftpd/conf/ChrootEveryone
+        content: "yes\n"
+        mode: '0644'
+
+    - name: Enable CreateHomeDir option
+      ansible.builtin.copy:
+        dest: /etc/pure-ftpd/conf/CreateHomeDir
+        content: "yes\n"
+        mode: '0644'
+
+    - name: Create PureDB configuration file
+      ansible.builtin.copy:
+        dest: /etc/pure-ftpd/conf/PureDB
+        content: "/etc/pure-ftpd/pureftpd.pdb\n"
+        mode: '0644'
+
+    - name: Ensure /etc/pure-ftpd/auth directory exists
+      ansible.builtin.file:
+        path: /etc/pure-ftpd/auth
+        state: directory
+        mode: '0755'
+
+    - name: Enable PureDB authentication
+      ansible.builtin.file:
+        src: /etc/pure-ftpd/conf/PureDB
+        path: /etc/pure-ftpd/auth/40PureDB
+        state: link
+        force: true
+
+    - name: Ensure Pure-FTPd password file exists
+      ansible.builtin.file:
+        path: /etc/pure-ftpd/pureftpd.passwd
+        state: touch
+        mode: '0600'
+  
+    - name: Create virtual FTP user
+      ansible.builtin.command:
+        cmd: "echo -e '{{ ftp_virtual_password }}\n{{ ftp_virtual_password }}' | pure-pw useradd {{ ftp_virtual_user }} -u ftpuser -d {{ ftp_home_directory }} -m"
+      environment:
+        PURE_PASSWD: /etc/pure-ftpd/pureftpd.passwd
+        PURE_DB: /etc/pure-ftpd/pureftpd.pdb
+      become: true
+
+    - name: Generate Pure-FTPd database
+      ansible.builtin.command:
+        cmd: "pure-pw mkdb"
+      environment:
+        PURE_PASSWD: /etc/pure-ftpd/pureftpd.passwd
+        PURE_DB: /etc/pure-ftpd/pureftpd.pdb
+      become: true
+
+    - name: Restart Pure-FTPd service
+      ansible.builtin.service:
+        name: pure-ftpd
+        state: restarted
+        enabled: true
+      become: true
+
+    # Backup Setup
+    - name: Install rsync and cron
+      ansible.builtin.apt:
+        name:
+          - rsync
+          - cron
+        state: present
+        update_cache: true
+
+    - name: Ensure backup destination directory exists
+      ansible.builtin.file:
+        path: "{{ backup_destination }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create backup script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/backup_html.sh
+        content: |
+          #!/bin/bash
+          rsync -a {{ backup_source }} {{ backup_destination }}
+        mode: '0755'
+
+    - name: Schedule daily backup at 3 AM
+      ansible.builtin.cron:
+        name: "Daily HTML Backup"
+        minute: "0"
+        hour: "3"
+        job: "/usr/local/bin/backup_html.sh"
